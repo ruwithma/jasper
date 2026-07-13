@@ -1,0 +1,12 @@
+# jasper scan output (per-target recon dirs — contain target data, hashes, /etc/hosts backups)
+jasper-*/
+
+# feroxbuster resume/state files (leak target names)
+*.state
+ferox-*
+
+# local tooling / editor / OS cruft
+.claude/
+*.swp
+*~
+.DS_Store

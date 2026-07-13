@@ -1,0 +1,914 @@
+#!/usr/bin/env bash
+#
+# jasper - fast CTF / HackTheBox all-in-one initial recon
+#
+# Full-port scan -> service/version -> hostname (cert/AD) discovery + /etc/hosts
+# -> per-service enumeration (web, SMB, LDAP/AD, Kerberos, FTP, SNMP, DBs, NFS,
+# RPC, WinRM, redis, ...) using the standard Kali toolset, all in one command.
+#
+# Usage:  jasper <target> [options]           (run as root to auto-edit /etc/hosts)
+# Example: sudo jasper 10.10.11.55
+#
+set -uo pipefail
+
+VERSION="1.0"
+
+# ---------------------------------------------------------------------------
+# colors
+# ---------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+  C_RESET=$'\e[0m'; C_BOLD=$'\e[1m'; C_DIM=$'\e[2m'
+  C_RED=$'\e[91m'; C_GRN=$'\e[92m'; C_YEL=$'\e[93m'
+  C_BLU=$'\e[94m'; C_MAG=$'\e[95m'; C_CYN=$'\e[96m'
+  # unicode glyphs + box rules (nice tty only)
+  G_INFO="•"; G_OK="✔"; G_WARN="▲"; G_ERR="✗"; G_ARROW="›"
+  G_HL="─"; G_TL="╭"; G_TR="╮"; G_BL="╰"; G_BR="╯"; G_V="│"
+else
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GRN=""; C_YEL=""; C_BLU=""; C_MAG=""; C_CYN=""
+  G_INFO="*"; G_OK="+"; G_WARN="!"; G_ERR="-"; G_ARROW=">"
+  G_HL="-"; G_TL="+"; G_TR="+"; G_BL="+"; G_BR="+"; G_V="|"
+fi
+
+# ---------------------------------------------------------------------------
+# wordlists (fall back gracefully if missing)
+# ---------------------------------------------------------------------------
+WL_DIR_FAST="/usr/share/wordlists/dirb/common.txt"
+WL_DIR_DEEP="/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt"
+WL_VHOST="/usr/share/dnsrecon/dnsrecon/data/subdomains-top1mil-5000.txt"
+WL_VHOST_SMALL="/usr/share/dnsrecon/dnsrecon/data/subdomains-top1mil-20000.txt"
+WL_SNMP="/usr/share/wordlists/seclists/Discovery/SNMP/common-snmp-community-strings.txt"
+
+COMMON_WEB_PORTS="80 443 8080 8443 8000 8888 3000 5000 8081 9000 9090 8181 7001"
+MAXJOBS=6   # parallel service-enum jobs
+FEROX_TL="10m"   # hard cap per feroxbuster dir-brute (so a slow host can't hang the run)
+FFUF_TL="600"    # same, seconds, for the ffuf dir-brute fallback
+
+# ---------------------------------------------------------------------------
+# args
+# ---------------------------------------------------------------------------
+TARGET=""; DOMAIN=""; OUTDIR=""; DIR_WL=""; THREADS=50
+DO_WEB=1; DO_VHOST=1; DO_NUCLEI=0; DO_UDP=1; DEEP=0; QUICK=0; DO_SVC=1
+CRED_USER=""; CRED_PASS=""; CRED_HASH=""; LOCAL_AUTH=0
+
+usage() {
+  cat <<EOF
+${C_BOLD}jasper v$VERSION${C_RESET} - fast all-in-one CTF recon
+
+${C_BOLD}USAGE${C_RESET}
+  jasper <target> [options]     (run with sudo to auto-manage /etc/hosts + UDP)
+
+${C_BOLD}OPTIONS${C_RESET}
+  -d, --domain <name>   AD/vhost base (e.g. active.htb); auto-detected otherwise
+  -o, --out <dir>       output dir (default: jasper-<target>)
+  -w, --wordlist <f>    dir-scan wordlist (default: dirb/common.txt)
+  -t, --threads <n>     web brute concurrency (default: 50)
+  -x, --nuclei          run nuclei vuln templates on web services
+  -u, --user <name>     known username -> authenticated re-enum + cred spray
+  -p, --pass <pass>     known password (use with -u)
+  -H, --hash <lm:nt>    NTLM hash for pass-the-hash (use with -u instead of -p)
+      --local-auth      creds are local (not domain) accounts
+      --no-udp          skip top UDP scan (SNMP/DNS/SunRPC etc.)
+      --no-svc          skip per-service enumeration (SMB/LDAP/... )
+      --no-web          skip web content enumeration
+      --no-vhost        skip vhost/subdomain fuzzing
+      --deep            heavier wordlists (dirbuster medium)
+      --quick           top-2000 TCP ports only (faster)
+  -h, --help            this help
+
+${C_BOLD}EXAMPLES${C_RESET}
+  sudo jasper 10.10.11.55           # full: ports+services+hosts+enum
+  sudo jasper 10.10.10.100 -x       # + nuclei web vuln pass
+  jasper target.htb --quick         # fast pass, no root
+  jasper 10.10.10.161 -u bob -p S3cr # + authenticated re-enum & cred spray
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--domain)   DOMAIN="$2"; shift 2;;
+    -o|--out)      OUTDIR="$2"; shift 2;;
+    -w|--wordlist) DIR_WL="$2"; shift 2;;
+    -t|--threads)  THREADS="$2"; shift 2;;
+    -x|--nuclei)   DO_NUCLEI=1; shift;;
+    -u|--user)     CRED_USER="$2"; shift 2;;
+    -p|--pass)     CRED_PASS="$2"; shift 2;;
+    -H|--hash)     CRED_HASH="$2"; shift 2;;
+    --local-auth)  LOCAL_AUTH=1; shift;;
+    --no-udp)      DO_UDP=0; shift;;
+    --no-svc)      DO_SVC=0; shift;;
+    --no-web)      DO_WEB=0; shift;;
+    --no-vhost)    DO_VHOST=0; shift;;
+    --deep)        DEEP=1; shift;;
+    --quick)       QUICK=1; shift;;
+    -h|--help)     usage; exit 0;;
+    -*)            echo "unknown option: $1" >&2; usage; exit 1;;
+    *)             [[ -z "$TARGET" ]] && TARGET="$1" || echo "extra arg: $1" >&2; shift;;
+  esac
+done
+[[ -z "$TARGET" ]] && { usage; exit 1; }
+[[ -z "$OUTDIR" ]] && OUTDIR="jasper-${TARGET}"
+[[ -z "$DIR_WL" ]] && { [[ $DEEP -eq 1 ]] && DIR_WL="$WL_DIR_DEEP" || DIR_WL="$WL_DIR_FAST"; }
+# the deep (dirbuster-medium) wordlist is ~220k words - give the dir-brute more headroom
+[[ $DEEP -eq 1 ]] && { FEROX_TL="25m"; FFUF_TL="1500"; }
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+START_TS=$(date +%s)
+# elapsed since start, mm:ss, dimmed - gives every line a sense of progress
+_el(){ local s=$(( $(date +%s) - START_TS )); printf '%02d:%02d' $((s/60)) $((s%60)); }
+log()  { printf '%s %s%s%s %s\n' "${C_DIM}[$(_el)]${C_RESET}" "${C_CYN}" "$G_INFO" "${C_RESET}" "$*"; }
+ok()   { printf '%s %s%s%s %s\n' "${C_DIM}[$(_el)]${C_RESET}" "${C_GRN}" "$G_OK"   "${C_RESET}" "$*"; }
+warn() { printf '%s %s%s%s %s\n' "${C_DIM}[$(_el)]${C_RESET}" "${C_YEL}" "$G_WARN" "${C_RESET}" "$*"; }
+err()  { printf '%s %s%s%s %s\n' "${C_DIM}[$(_el)]${C_RESET}" "${C_RED}" "$G_ERR"  "${C_RESET}" "$*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+# phase header: a full-width titled rule, e.g.  ── ▸ PORT SCAN ─────────────
+PHASE_N=0
+phase(){
+  PHASE_N=$((PHASE_N+1))
+  local title="$*" w=64 label
+  label=" ${C_BOLD}${C_MAG}$title${C_RESET}${C_MAG} "
+  local plain="  $title "; local fill=$(( w - ${#plain} - 4 )); (( fill < 0 )) && fill=0
+  local rule; printf -v rule '%*s' "$fill" ''; rule="${rule// /$G_HL}"
+  echo
+  printf '%s%s%s %s%s%s%s\n' \
+    "${C_MAG}" "$G_HL$G_HL" "${C_RESET}" \
+    "$label" \
+    "${C_MAG}" "$rule" "${C_RESET}"
+}
+pick_wl(){ for f in "$@"; do [[ -f "$f" ]] && { echo "$f"; return 0; }; done; return 1; }
+sumh()  { echo "" >> "$SUMMARY"; echo "## $*" >> "$SUMMARY"; }   # summary heading
+# run a command in the background, capping concurrency at MAXJOBS
+run_bg(){ while (( $(jobs -rp | wc -l) >= MAXJOBS )); do wait -n 2>/dev/null || break; done; "$@" & }
+
+banner() {
+  printf '%b' "${C_MAG}${C_BOLD}"
+  cat <<'ART'
+     _   _    ____  ____  _____ ____
+    | | / \  / ___||  _ \| ____|  _ \
+ _  | |/ _ \ \___ \| |_) |  _| | |_) |
+| |_| / ___ \ ___) |  __/| |___|  _ <
+ \___/_/   \_\____/|_|   |_____|_| \_\
+ART
+  printf '%s  %sv%s  %s  fast all-in-one CTF / HTB recon%s\n\n' \
+    "${C_RESET}" "${C_DIM}" "$VERSION" "$G_ARROW" "${C_RESET}"
+}
+
+IS_ROOT=0; [[ $EUID -eq 0 ]] && IS_ROOT=1
+SUDO=""; [[ $IS_ROOT -eq 0 ]] && have sudo && sudo -n true 2>/dev/null && SUDO="sudo"
+
+banner
+# aligned key/value run panel
+kv(){ printf '  %s%-8s%s %s\n' "${C_DIM}" "$1" "${C_RESET}" "$2"; }
+if [[ $IS_ROOT -eq 1 ]]; then MODE="${C_GRN}root${C_RESET} ${C_DIM}(/etc/hosts + UDP enabled)${C_RESET}"
+else MODE="${C_YEL}non-root${C_RESET} ${C_DIM}(sudo for /etc/hosts + UDP)${C_RESET}"; fi
+kv "target"  "${C_BOLD}$TARGET${C_RESET}"
+kv "mode"    "$MODE"
+[[ -n "$DOMAIN" ]] && kv "domain" "${C_BOLD}$DOMAIN${C_RESET}"
+kv "outdir"  "$OUTDIR"
+echo
+
+mkdir -p "$OUTDIR"/{scans,web,services,vhost,loot}
+SUMMARY="$OUTDIR/SUMMARY.txt"
+: > "$SUMMARY"
+echo "# jasper recon - $TARGET - $(date)" >> "$SUMMARY"
+
+ping -c1 -W2 "$TARGET" >/dev/null 2>&1 && ok "host up (ping)" || warn "no ping reply (ICMP maybe blocked) - continuing"
+
+# ---------------------------------------------------------------------------
+# PHASE 0 - tool preflight
+#   so an empty module file means "found nothing" and NOT "tool not installed".
+# ---------------------------------------------------------------------------
+# tool -> the recon area it powers (shown when the tool is missing)
+declare -A TOOL_AREA=(
+  [rustscan]="fast full-port scan (falls back to nmap -p-)"
+  [feroxbuster]="web directory brute (falls back to ffuf)"
+  [ffuf]="vhost fuzz + dir-brute fallback"
+  [whatweb]="web fingerprint / WordPress detection"
+  [nuclei]="web vuln templates (-x)"
+  [wpscan]="WordPress scan"
+  [sslscan]="TLS cert / cipher inspection"
+  [nxc]="SMB/WinRM/LDAP enum + credential spray (-u)"
+  [smbmap]="SMB share permissions"
+  [smbclient]="SMB share listing"
+  [enum4linux]="SMB users / domain enum"
+  [ldapsearch]="LDAP anonymous dump"
+  [impacket-GetNPUsers]="AS-REP roast"
+  [impacket-GetUserSPNs]="kerberoast (with creds)"
+  [onesixtyone]="SNMP community brute"
+  [snmpwalk]="SNMP walk"
+  [showmount]="NFS exports"
+  [redis-cli]="redis unauth check"
+  [dig]="DNS AXFR / records"
+  [amass]="passive subdomain harvest"
+  [ssh-audit]="SSH weak-config audit"
+)
+phase "TOOL PREFLIGHT"
+for t in nmap curl; do have "$t" || err "MISSING CORE tool ${C_BOLD}$t${C_RESET} - jasper depends on it"; done
+MISSING_TOOLS=()
+for t in "${!TOOL_AREA[@]}"; do have "$t" || MISSING_TOOLS+=("$t"); done
+if (( ${#MISSING_TOOLS[@]} )); then
+  warn "missing optional tools - the modules below are SKIPPED, not failed (empty output != nothing found):"
+  sumh "MISSING TOOLS (these recon areas are blind)"
+  for t in $(printf '%s\n' "${MISSING_TOOLS[@]}" | sort); do
+    echo "        ${C_YEL}$t${C_RESET} - ${TOOL_AREA[$t]}"
+    echo "  $t - ${TOOL_AREA[$t]}" >> "$SUMMARY"
+  done
+  echo "        install with: ${C_BOLD}apt install <tool>${C_RESET}  (nxc=netexec, impacket-* via pipx install impacket)"
+else
+  ok "all optional tools present"
+fi
+
+# ---------------------------------------------------------------------------
+# PHASE 1 - port scan
+# ---------------------------------------------------------------------------
+phase "PORT SCAN"
+OPEN_PORTS=""
+# merge a comma list into OPEN_PORTS, de-duped and sorted
+merge_ports(){ OPEN_PORTS=$(printf '%s\n' ${OPEN_PORTS//,/ } ${1//,/ } | grep -E '^[0-9]+$' | sort -un | paste -sd, -); }
+if [[ $QUICK -eq 1 ]]; then
+  log "nmap top-2000 TCP"
+  nmap -T4 --top-ports 2000 --open -oG "$OUTDIR/scans/ports.gnmap" "$TARGET" >/dev/null 2>&1
+  merge_ports "$(grep -oP '\d+/open' "$OUTDIR/scans/ports.gnmap" 2>/dev/null | cut -d/ -f1 | paste -sd, -)"
+else
+  # gentle baseline FIRST: reliably grabs the common service ports before any
+  # aggressive sweep can trip the host's rate-limit defense (which corrupts a full
+  # scan into a partial/empty result). This baseline survives even if rustscan is
+  # then throttled, so we never silently miss web/SMB/etc.
+  log "baseline nmap top-1000"
+  nmap -Pn -T3 --top-ports 1000 --open -oG "$OUTDIR/scans/ports_base.gnmap" "$TARGET" >/dev/null 2>&1
+  merge_ports "$(grep -oP '\d+/open' "$OUTDIR/scans/ports_base.gnmap" 2>/dev/null | cut -d/ -f1 | paste -sd, -)"
+  if have rustscan; then
+    log "rustscan full 65535 TCP ports"
+    # -t 2000 --tries 2: high-latency/heavily-filtered AD boxes (e.g. ADWS 9389 +
+    # ephemeral 49xxx msrpc) drop slow-responding open ports on a single 1s try,
+    # so we give each port a longer window and a second attempt before calling it closed
+    rustscan -a "$TARGET" --ulimit 5000 -t 2000 --tries 2 -g --scan-order random 2>/dev/null > "$OUTDIR/scans/rustscan.txt"
+    merge_ports "$(grep -oP '\[\K[0-9,]+' "$OUTDIR/scans/rustscan.txt" | head -1)"
+  else
+    log "rustscan missing - nmap -p-"
+    nmap -T4 -p- --open -oG "$OUTDIR/scans/ports.gnmap" "$TARGET" >/dev/null 2>&1
+    merge_ports "$(grep -oP '\d+/open' "$OUTDIR/scans/ports.gnmap" 2>/dev/null | cut -d/ -f1 | paste -sd, -)"
+  fi
+fi
+# safety net: a full 65535-port blast can trip a host's rate-limit/blackhole defense,
+# so it drops everything (incl. our fallback -p-) for a short penalty window and the
+# scan comes back empty even though services are up. Cool down to let that window
+# clear, then probe gently (-T2, no host-discovery) so we don't re-trip the block.
+if [[ -z "$OPEN_PORTS" ]]; then
+  warn "full-port scan returned nothing - host may be rate-limiting; cooling down 20s then a gentle top-1000 retry"
+  sleep 20
+  nmap -Pn -T2 --top-ports 1000 --open -oG "$OUTDIR/scans/ports_retry.gnmap" "$TARGET" >/dev/null 2>&1
+  OPEN_PORTS=$(grep -oP '\d+/open' "$OUTDIR/scans/ports_retry.gnmap" 2>/dev/null | cut -d/ -f1 | sort -un | paste -sd, -)
+  [[ -n "$OPEN_PORTS" ]] && warn "retry found ports the full scan missed (host was rate-limiting) - re-run later for a full 65535 port list"
+fi
+[[ -z "$OPEN_PORTS" ]] && { err "no open TCP ports (even after top-1000 retry). bailing."; echo "no open TCP ports" >> "$SUMMARY"; exit 2; }
+ok "open TCP: ${C_BOLD}$OPEN_PORTS${C_RESET}"
+sumh "OPEN TCP PORTS"; echo "$OPEN_PORTS" >> "$SUMMARY"
+
+# ---------------------------------------------------------------------------
+# PHASE 2 - service / version detection
+# ---------------------------------------------------------------------------
+phase "SERVICE DETECTION"
+log "nmap -sCV on open ports"
+nmap -sC -sV -T4 -p "$OPEN_PORTS" -oN "$OUTDIR/scans/services.txt" -oX "$OUTDIR/scans/services.xml" "$TARGET" >/dev/null 2>&1
+SVCFILE="$OUTDIR/scans/services.txt"
+grep -E '^[0-9]+/tcp' "$SVCFILE" | sed 's/^/    /'
+sumh "SERVICES"; grep -E '^[0-9]+/tcp' "$SVCFILE" >> "$SUMMARY"
+
+# map port -> service token (3rd column of the nmap line, e.g. "ssl/https")
+declare -A SVC
+while read -r ln; do
+  svc_p="${ln%%/*}"; svc_s=$(awk '{print $3}' <<<"$ln")
+  SVC[$svc_p]="$svc_s"
+done < <(grep -E '^[0-9]+/tcp +open' "$SVCFILE")
+unset svc_p svc_s ln
+
+# TLS test uses the SERVICE COLUMN only (avoids matching "OpenSSL/1.0.2k" in banners)
+is_tls(){ local s="${SVC[$1]:-}"; [[ "$s" == ssl/* || "$s" == *https* || "$s" == *ssl* ]]; }
+scheme_for(){ if is_tls "$1" || [[ "$1" == 443 || "$1" == 8443 ]]; then echo https; else echo http; fi; }
+
+# ---------------------------------------------------------------------------
+# PHASE 3 - hostname / AD-domain discovery + /etc/hosts
+# ---------------------------------------------------------------------------
+HOSTS_FILE="/etc/hosts"
+declare -a DISCOVERED_HOSTS=()
+
+# harvest hostnames from TLS certs, HTTP redirects, and AD scripts (smb-os-discovery,
+# rdp-ntlm-info, ldap rootDSE) present in nmap -sC output or curl headers
+harvest_hostnames() {
+  grep -hoiE \
+    -e 'Nmap scan report for [a-zA-Z0-9._-]+' \
+    -e 'commonName=[^/,]+' \
+    -e 'DNS:[a-zA-Z0-9._-]+' \
+    -e 'Did not follow redirect to https?://[a-zA-Z0-9._-]+' \
+    -e 'Location: https?://[a-zA-Z0-9._-]+' \
+    -e 'FQDN: [a-zA-Z0-9._-]+' \
+    -e 'Computer name: [a-zA-Z0-9._-]+' \
+    -e 'DNS_Computer_Name: [a-zA-Z0-9._-]+' \
+    -e 'Domain name: [a-zA-Z0-9._-]+' \
+    -e 'DNS_Domain_Name: [a-zA-Z0-9._-]+' \
+    -e 'dnsHostName: [a-zA-Z0-9._-]+' \
+    "$@" 2>/dev/null \
+  | sed -E 's#.*(report for |commonName=|DNS:|https?://|FQDN: |name: |Name: )##; s#/.*##; s/[[:space:]]//g' \
+  | grep -viE '^(localhost|somestate|someorganization|--|localhost\.localdomain)$' \
+  | grep -vE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+  | grep -E '^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$' \
+  | tr 'A-Z' 'a-z' | sort -u
+}
+
+add_host_entry() {
+  local name="$1"; [[ -z "$name" ]] && return
+  grep -qiE "^[[:space:]]*$TARGET[[:space:]]+.*\b$name\b" "$HOSTS_FILE" 2>/dev/null && return
+  local other
+  other=$(grep -iE "^[[:space:]]*[0-9.]+[[:space:]]+.*\b$name\b" "$HOSTS_FILE" 2>/dev/null \
+          | grep -v "^[[:space:]]*$TARGET\b" | awk '{print $1}' | head -1)
+  [[ -n "$other" ]] && warn "$name also maps to ${C_BOLD}$other${C_RESET} in /etc/hosts (stale entry will shadow $TARGET - remove it)"
+  if [[ $IS_ROOT -eq 1 ]]; then
+    [[ -f "$OUTDIR/loot/hosts.bak" ]] || cp "$HOSTS_FILE" "$OUTDIR/loot/hosts.bak" 2>/dev/null
+    printf '%s\t%s\t# jasper\n' "$TARGET" "$name" >> "$HOSTS_FILE"
+    ok "/etc/hosts ${C_GRN}updated${C_RESET}: ${C_BOLD}$name${C_RESET} ${G_ARROW} $TARGET"
+  else
+    warn "found host ${C_BOLD}$name${C_RESET} ${C_DIM}(not root - not written)${C_RESET} - add:  ${C_BOLD}echo '$TARGET  $name' | sudo tee -a /etc/hosts${C_RESET}"
+  fi
+}
+
+phase "HOSTNAME / DOMAIN DISCOVERY"
+mapfile -t DISCOVERED_HOSTS < <(harvest_hostnames "$SVCFILE")
+if [[ ${#DISCOVERED_HOSTS[@]} -gt 0 ]]; then
+  ok "hostnames: ${C_BOLD}${DISCOVERED_HOSTS[*]}${C_RESET}"
+  sumh "HOSTNAMES"; printf '%s\n' "${DISCOVERED_HOSTS[@]}" >> "$SUMMARY"
+  for h in "${DISCOVERED_HOSTS[@]}"; do add_host_entry "$h"; done
+  if [[ -z "$DOMAIN" ]]; then
+    WEB_HOST_AUTO="${DISCOVERED_HOSTS[0]}"
+    # base AD/vhost domain = dotted name with the FEWEST labels (e.g. prefer
+    # streamio.htb over dc.streamio.htb) so vhost fuzz targets FUZZ.<base>
+    local_bestdots=99
+    for h in "${DISCOVERED_HOSTS[@]}"; do
+      [[ "$h" == *.* ]] || continue
+      d="${h//[!.]/}"
+      if (( ${#d} < local_bestdots )); then local_bestdots=${#d}; DOMAIN="$h"; fi
+    done
+    log "web Host: ${C_BOLD}${DOMAIN:-$WEB_HOST_AUTO}${C_RESET}"
+  fi
+else
+  warn "no hostnames in cert/redirect/AD output (using IP)"
+fi
+
+# ---------------------------------------------------------------------------
+# PHASE 4 - UDP top ports (SNMP / DNS / SunRPC / TFTP ...)
+# ---------------------------------------------------------------------------
+declare -A UDP_SVC
+UDP_PID=""
+if [[ $DO_UDP -eq 1 ]]; then
+  if [[ $IS_ROOT -eq 1 || -n "$SUDO" ]]; then
+    # launch in the background so the ~40s UDP scan overlaps TCP service enumeration
+    # instead of blocking it. Results are joined + parsed just before UDP dispatch.
+    phase "UDP SCAN (top 50, background)"
+    log "UDP top-50 running in background (overlaps TCP enum)"
+    $SUDO nmap -sU --top-ports 50 --open -T4 -oN "$OUTDIR/scans/udp.txt" "$TARGET" >/dev/null 2>&1 &
+    UDP_PID=$!
+  else
+    warn "UDP scan needs root - run 'sudo jasper' (skipping)"
+  fi
+fi
+
+# ===========================================================================
+# per-service enumeration modules  (each writes services/<port>_<name>.txt)
+# ===========================================================================
+SVCDIR="$OUTDIR/services"
+
+enum_ftp() { local p=$1; local o="$SVCDIR/${p}_ftp.txt"
+  { echo "### FTP $TARGET:$p"
+    nmap -p$p --script ftp-anon,ftp-syst -T4 "$TARGET" 2>/dev/null | sed -n '/PORT/,$p'
+    echo "--- anonymous login test ---"
+    curl -sS -m 15 --user 'anonymous:anonymous@x' "ftp://$TARGET:$p/" 2>&1 | head -40
+  } > "$o" 2>&1; }
+
+enum_ssh() { local p=$1; local o="$SVCDIR/${p}_ssh.txt"
+  { echo "### SSH $TARGET:$p"
+    echo "--- host key + algos + auth methods ---"
+    nmap -p$p --script "ssh-hostkey,ssh2-enum-algos,ssh-auth-methods" -T4 "$TARGET" 2>/dev/null | sed -n '/PORT/,$p'
+    if have ssh-audit; then echo "--- ssh-audit ---"; ssh-audit -n "$TARGET" -p "$p" 2>/dev/null | grep -iE '\(rec\)|\(cve|\(warn|remove|password|key exchange' | head -30; fi
+    echo "note: if only password auth, try creds from other services; user enum on OpenSSH <7.7 (CVE-2018-15473)"
+  } > "$o" 2>&1; }
+
+enum_telnet() { local p=$1; local o="$SVCDIR/${p}_telnet.txt"
+  { echo "### telnet $TARGET:$p"
+    nmap -p$p --script "telnet-encryption,telnet-ntlm-info,banner" -T4 "$TARGET" 2>/dev/null | sed -n '/PORT/,$p'
+    echo "note: try default/blank creds; watch banner for device/OS hints"
+  } > "$o" 2>&1; }
+
+enum_vnc() { local p=$1; local o="$SVCDIR/${p}_vnc.txt"
+  { echo "### VNC $TARGET:$p"
+    nmap -p$p --script "vnc-info,realvnc-auth-bypass,vnc-title" -T4 "$TARGET" 2>/dev/null | sed -n '/PORT/,$p'
+    echo "note: connect with  vncviewer $TARGET::$p  (CVE-2006-2369 realvnc auth bypass flagged above if present)"
+  } > "$o" 2>&1; }
+
+enum_smtp() { local p=$1; local o="$SVCDIR/${p}_smtp.txt"
+  nmap -p$p --script smtp-commands,smtp-open-relay,smtp-ntlm-info -T4 "$TARGET" 2>/dev/null | sed -n '/PORT/,$p' > "$o" 2>&1; }
+
+enum_dns() { local p=$1; local o="$SVCDIR/${p}_dns.txt"
+  { echo "### DNS $TARGET"
+    for d in $DOMAIN "${DISCOVERED_HOSTS[@]}"; do
+      [[ -z "$d" ]] && continue
+      echo "--- AXFR zone transfer @$d ---"; dig +short axfr "$d" @"$TARGET" 2>/dev/null | head -60
+      echo "--- ANY $d ---"; dig +noall +answer any "$d" @"$TARGET" 2>/dev/null
+    done
+  } > "$o" 2>&1; }
+
+enum_finger() { local p=$1; local o="$SVCDIR/${p}_finger.txt"
+  nmap -p$p --script finger -T4 "$TARGET" 2>/dev/null | sed -n '/PORT/,$p' > "$o" 2>&1; }
+
+enum_rpc() { local p=$1; local o="$SVCDIR/${p}_msrpc.txt"
+  { echo "### MSRPC $TARGET:$p"; have impacket-rpcdump && impacket-rpcdump "$TARGET" 2>/dev/null | head -60; } > "$o" 2>&1; }
+
+enum_smb() { local p=$1; local o="$SVCDIR/smb.txt"   # single module for 139/445
+  { echo "### SMB $TARGET"
+    echo "--- netexec (null session) ---"; have nxc && nxc smb "$TARGET" -u '' -p '' --shares 2>&1 | head -40
+    echo "--- netexec (guest) ---";        have nxc && nxc smb "$TARGET" -u 'guest' -p '' --shares 2>&1 | grep -i share | head
+    echo "--- smbmap null ---";            have smbmap && smbmap -H "$TARGET" -u null 2>&1 | grep -viE 'working on it|^\[\+\] IP' | head -30
+    echo "--- smbclient list ---";         have smbclient && smbclient -N -L "//$TARGET/" 2>&1 | head -30
+    echo "--- nmap smb scripts ---";       nmap -p$p --script "smb-os-discovery,smb-enum-shares,smb-enum-users,smb2-security-mode,smb-vuln-ms17-010" -T4 "$TARGET" 2>/dev/null | sed -n '/PORT/,$p'
+    echo "--- enum4linux (brief) ---";     have enum4linux && timeout 120 enum4linux -A "$TARGET" 2>/dev/null | grep -iE 'user:|share|domain|os |password policy|=== ' | head -50
+  } > "$o" 2>&1; }
+
+enum_ldap() { local p=$1; local o="$SVCDIR/${p}_ldap.txt"
+  { echo "### LDAP $TARGET:$p"
+    echo "--- rootDSE / naming contexts ---"
+    ldapsearch -x -H "ldap://$TARGET:$p" -s base -b '' namingContexts defaultNamingContext dnsHostName 2>/dev/null | grep -iE 'namingcontext|dnshostname|defaultnaming'
+    local base; base=$(ldapsearch -x -H "ldap://$TARGET:$p" -s base -b '' namingContexts 2>/dev/null | grep -i '^namingContexts:' | head -1 | awk '{print $2}')
+    if [[ -n "$base" ]]; then
+      echo "--- anonymous dump of $base (users/desc) ---"
+      ldapsearch -x -H "ldap://$TARGET:$p" -b "$base" 2>/dev/null | grep -iE '^dn:|sAMAccountName|description|userPrincipalName' | head -80
+    fi
+    nmap -p$p --script ldap-rootdse -T4 "$TARGET" 2>/dev/null | sed -n '/PORT/,$p'
+  } > "$o" 2>&1; }
+
+enum_kerberos() { local p=$1; local o="$SVCDIR/${p}_kerberos.txt"
+  { echo "### Kerberos $TARGET:$p  (domain: ${DOMAIN:-unknown})"
+    echo "Kerberos = Active Directory. Next steps once you have a user list:"
+    echo "  AS-REP roast : impacket-GetNPUsers $DOMAIN/ -usersfile users.txt -dc-ip $TARGET -no-pass"
+    echo "  Kerberoast   : impacket-GetUserSPNs $DOMAIN/user:pass -dc-ip $TARGET -request"
+    echo "  user enum    : kerbrute userenum -d $DOMAIN --dc $TARGET users.txt"
+    if [[ -n "$DOMAIN" ]] && have impacket-GetNPUsers; then
+      # prefer the real userlist that discover_ad_users harvested; fall back to a guess list
+      local ulist="$OUTDIR/loot/users.txt"
+      if [[ -s "$ulist" ]]; then
+        echo "--- AS-REP roast against loot/users.txt ($(grep -c . "$ulist") users) ---"
+      else
+        ulist="$SVCDIR/.kusers"; printf 'administrator\nguest\nsvc-alfresco\nadmin\nkrbtgt\n' > "$ulist"
+        echo "--- AS-REP roast with a tiny built-in guess list (no userlist harvested) ---"
+      fi
+      impacket-GetNPUsers "$DOMAIN/" -usersfile "$ulist" -dc-ip "$TARGET" -no-pass -format hashcat 2>/dev/null \
+        | tee -a "$OUTDIR/loot/asrep.txt" | grep -iE '\$krb5|does not require' | head
+      # kerberoast without creds (newer technique) using any harvested user
+      if [[ -s "$OUTDIR/loot/users.txt" ]] && have impacket-GetUserSPNs; then
+        local u1; u1=$(head -1 "$OUTDIR/loot/users.txt")
+        echo "--- kerberoast (no-preauth, via $u1) ---"
+        impacket-GetUserSPNs -no-preauth "$u1" -usersfile "$OUTDIR/loot/users.txt" -dc-host "$TARGET" "$DOMAIN/" 2>/dev/null \
+          | tee -a "$OUTDIR/loot/spn_hashes.txt" | grep -iE '\$krb5tgs|ServicePrincipalName' | head
+      fi
+    fi
+  } > "$o" 2>&1; }
+
+enum_snmp() { local p=$1; local o="$SVCDIR/${p}_snmp.txt"
+  { echo "### SNMP $TARGET:$p/udp"
+    local cs
+    if [[ -f "$WL_SNMP" ]]; then cs="$WL_SNMP"
+    else cs="$SVCDIR/.snmpstr"; printf 'public\nprivate\ncommunity\n' > "$cs"; fi
+    have onesixtyone && { echo "--- community strings ($cs) ---"; onesixtyone -c "$cs" "$TARGET" 2>/dev/null; }
+    if have snmpwalk; then echo "--- snmpwalk public (system + procs) ---"
+      snmpwalk -v2c -c public -t 3 -r 1 "$TARGET" 2>/dev/null | head -60; fi
+  } > "$o" 2>&1; }
+
+enum_nfs() { local p=$1; local o="$SVCDIR/${p}_nfs.txt"
+  { echo "### NFS/RPC $TARGET:$p"; rpcinfo -p "$TARGET" 2>/dev/null | head -30
+    echo "--- exports ---"; have showmount && showmount -e "$TARGET" 2>&1 | head; } > "$o" 2>&1; }
+
+enum_mssql()  { local p=$1; nmap -p$p --script "ms-sql-info,ms-sql-ntlm-info,ms-sql-empty-password" -T4 "$TARGET" 2>/dev/null | sed -n '/PORT/,$p' > "$SVCDIR/${p}_mssql.txt" 2>&1; }
+enum_mysql()  { local p=$1; nmap -p$p --script "mysql-info,mysql-empty-password,mysql-users" -T4 "$TARGET" 2>/dev/null | sed -n '/PORT/,$p' > "$SVCDIR/${p}_mysql.txt" 2>&1; }
+enum_pgsql()  { local p=$1; { echo "postgres open; try: psql -h $TARGET -U postgres (default no pass on some CTF boxes)"; nmap -p$p --script pgsql-brute -T4 "$TARGET" 2>/dev/null | sed -n '/PORT/,$p'; } > "$SVCDIR/${p}_postgres.txt" 2>&1; }
+enum_rdp()    { local p=$1; nmap -p$p --script "rdp-ntlm-info,rdp-enum-encryption" -T4 "$TARGET" 2>/dev/null | sed -n '/PORT/,$p' > "$SVCDIR/${p}_rdp.txt" 2>&1; }
+enum_winrm()  { local p=$1; { echo "WinRM open. With creds:  evil-winrm -i $TARGET -u USER -p PASS"; nmap -p$p --script http-ntlm-info -T4 "$TARGET" 2>/dev/null | sed -n '/PORT/,$p'; } > "$SVCDIR/${p}_winrm.txt" 2>&1; }
+enum_redis()  { local p=$1; { echo "### redis $TARGET:$p"; have redis-cli && redis-cli -h "$TARGET" -p "$p" --no-auth-warning INFO server 2>&1 | head -20; redis-cli -h "$TARGET" -p "$p" --no-auth-warning KEYS '*' 2>&1 | head; } > "$SVCDIR/${p}_redis.txt" 2>&1; }
+enum_mongo()  { local p=$1; nmap -p$p --script "mongodb-info,mongodb-databases" -T4 "$TARGET" 2>/dev/null | sed -n '/PORT/,$p' > "$SVCDIR/${p}_mongodb.txt" 2>&1; }
+
+# is TCP port $1 in the open set?
+port_open(){ [[ ",$OPEN_PORTS," == *",$1,"* ]]; }
+
+# unauthenticated AD user discovery -> loot/users.txt. This is the bootstrap every
+# AD writeup relies on: RID-cycle / null-session your way to a real userlist, THEN
+# AS-REP roast + kerberoast it. Runs synchronously (before parallel dispatch) so the
+# Kerberos module can consume the list. Multiple sources, best-effort, deduped.
+discover_ad_users() {
+  local uf="$OUTDIR/loot/users.txt" tmp="$OUTDIR/loot/.users_raw" o="$SVCDIR/ad_users.txt"
+  : > "$tmp"
+  {
+    echo "### AD USER DISCOVERY (unauthenticated) -> loot/users.txt"
+    if have nxc; then
+      for acc in "':'" "guest:"; do
+        u="${acc%%:*}"; u="${u//\'/}"
+        echo "--- nxc smb --rid-brute (user='${u:-<null>}') ---"
+        nxc smb "$TARGET" -u "$u" -p '' --rid-brute 2>/dev/null \
+          | grep -iF '(SidTypeUser)' | grep -oP '\\\K[^ ]+(?= \(SidTypeUser\))' >> "$tmp"
+      done
+    fi
+    if have rpcclient; then
+      echo "--- rpcclient null enumdomusers ---"
+      rpcclient -U '' -N "$TARGET" -c enumdomusers 2>/dev/null | grep -oP 'user:\[\K[^]]+' >> "$tmp"
+    fi
+    if have impacket-lookupsid && [[ -n "$DOMAIN" ]]; then
+      echo "--- impacket-lookupsid (guest, brute SIDs) ---"
+      impacket-lookupsid -no-pass "guest@$DOMAIN" 2>/dev/null | grep -iF '(SidTypeUser)' | grep -oP '\\\K[^ ]+(?= \(SidTypeUser\))' >> "$tmp"
+    fi
+    if have ldapsearch; then
+      local base; base=$(ldapsearch -x -H "ldap://$TARGET" -s base -b '' namingContexts 2>/dev/null | grep -i '^namingContexts:' | head -1 | awk '{print $2}')
+      if [[ -n "$base" ]]; then
+        echo "--- ldap anonymous sAMAccountName ($base) ---"
+        ldapsearch -x -H "ldap://$TARGET" -b "$base" '(objectClass=user)' sAMAccountName 2>/dev/null \
+          | grep -oiP '^sAMAccountName:\s*\K\S+' >> "$tmp"
+      fi
+    fi
+  } > "$o" 2>&1
+  # clean: drop machine accounts ($-suffixed), keep valid names, dedupe
+  grep -aE '^[a-zA-Z0-9._-]+$' "$tmp" 2>/dev/null | grep -avE '\$$' | sort -u > "$uf"
+  local n; n=$(grep -c . "$uf" 2>/dev/null); n=${n:-0}
+  echo "--- collected $n unique users ---" >> "$o"
+  cat "$uf" >> "$o"
+  rm -f "$tmp"
+  echo "$n"
+}
+
+# authenticated re-enumeration + credential spray across every open protocol.
+# runs only when -u is supplied; netexec (nxc) does the multi-protocol heavy lifting.
+auth_enum() {
+  local o="$SVCDIR/auth_creds.txt"
+  local who="${CRED_DOMAIN:+$CRED_DOMAIN/}$CRED_USER"
+  # shared nxc auth args (password or pass-the-hash, domain or local)
+  local -a A=(-u "$CRED_USER")
+  if [[ -n "$CRED_HASH" ]]; then A+=(-H "$CRED_HASH"); else A+=(-p "$CRED_PASS"); fi
+  [[ $LOCAL_AUTH -eq 1 ]] && A+=(--local-auth)
+  [[ $LOCAL_AUTH -eq 0 && -n "$CRED_DOMAIN" ]] && A+=(-d "$CRED_DOMAIN")
+  {
+    echo "### AUTHENTICATED ENUM as $who   (Pwn3d! = admin/local-admin)"
+    if ! have nxc; then echo "[skipped: nxc/netexec not installed - the whole authenticated pass needs it]"; fi
+    if have nxc; then
+      if port_open 445 || port_open 139; then
+        echo "--- nxc smb (shares/users/groups/pass-pol) ---"
+        nxc smb "$TARGET" "${A[@]}" --shares --users --groups --pass-pol 2>&1 | grep -viE 'https://|^SMB.*\[\*\] Windows.*\(name' | head -60
+      fi
+      if port_open 5985 || port_open 5986; then
+        echo "--- nxc winrm (Pwn3d = shell via evil-winrm) ---"
+        nxc winrm "$TARGET" "${A[@]}" 2>&1 | head -10
+      fi
+      if port_open 389 || port_open 636 || port_open 3268; then
+        echo "--- nxc ldap (+ kerberoast / asreproast to loot/) ---"
+        nxc ldap "$TARGET" "${A[@]}" --kerberoasting "$OUTDIR/loot/kerberoast.txt" --asreproast "$OUTDIR/loot/asrep.txt" 2>&1 | head -30
+      fi
+      port_open 1433 && { echo "--- nxc mssql ---"; nxc mssql "$TARGET" "${A[@]}" 2>&1 | head -8; }
+      port_open 22   && { echo "--- nxc ssh ---";   nxc ssh   "$TARGET" "${A[@]}" 2>&1 | head -6; }
+      port_open 3389 && { echo "--- nxc rdp ---";   nxc rdp   "$TARGET" "${A[@]}" 2>&1 | head -6; }
+      port_open 5432 && { echo "--- nxc postgres ---"; nxc postgres "$TARGET" "${A[@]}" 2>&1 | head -8; }
+    fi
+    # kerberoast via impacket when we have a real domain + password (SPN accounts -> crackable hashes)
+    if [[ $LOCAL_AUTH -eq 0 && -n "$CRED_DOMAIN" && -n "$CRED_PASS" ]] && port_open 88 && have impacket-GetUserSPNs; then
+      echo "--- impacket kerberoast ---"
+      impacket-GetUserSPNs "$CRED_DOMAIN/$CRED_USER:$CRED_PASS" -dc-ip "$TARGET" -request -outputfile "$OUTDIR/loot/spn_hashes.txt" 2>&1 | grep -iE '\$krb5tgs|ServicePrincipalName|error' | head -20
+    fi
+    echo
+    echo "next: crack loot hashes ->  hashcat -m 18200 loot/asrep.txt rockyou   /   -m 13100 loot/spn_hashes.txt rockyou"
+    [[ $(port_open 5985 && echo y) ]] && echo "      if WinRM Pwn3d ->  evil-winrm -i $TARGET -u $CRED_USER -p '$CRED_PASS'"
+  } > "$o" 2>&1
+}
+
+# scan all collected output and print a severity-ranked "do this first" list so
+# the reader isn't left to eyeball a flat SUMMARY. Conservative patterns only.
+prioritize() {
+  local sf="$SVCDIR" wf="$OUTDIR/web" lf="$OUTDIR/loot" n=0 ncrit=0 nhigh=0
+  # pattern present in any of the given files/globs?
+  any(){ local pat=$1; shift; grep -rqiE "$pat" "$@" 2>/dev/null; }
+  # each finding is "<what> -> <do this>": render the what in bold, the action
+  # dimmed on its own indented line, with a severity icon. Much easier to scan
+  # than one dense line per finding.
+  emit(){ local tag=$1; shift; local msg="$*" c icon head act
+    case $tag in
+      CRIT) c=$C_RED; icon="●"; ncrit=$((ncrit+1)) ;;
+      HIGH) c=$C_YEL; icon="●"; nhigh=$((nhigh+1)) ;;
+      *)    c=$C_CYN; icon="○" ;;
+    esac
+    n=$((n+1)); head="${msg%% -> *}"; act="${msg#* -> }"
+    printf '  %s%s %s%-4s%s %s%s%s\n' "$c" "$icon" "${C_BOLD}" "$tag" "${C_RESET}" "${C_BOLD}" "$head" "${C_RESET}"
+    [[ "$act" != "$msg" ]] && printf '         %s↳ %s%s\n' "${C_DIM}" "$act" "${C_RESET}"
+    echo "[$tag] $msg" >> "$SUMMARY"; }
+
+  phase "START HERE  (ranked attack surface)"
+  sumh "START HERE (ranked - highest-value findings first)"
+
+  # ---- CRITICAL: usually a direct foothold ----
+  any 'ms17-010' "$sf"/*.txt && any 'VULNERABLE' "$sf"/*.txt && emit CRIT "SMB ms17-010 (EternalBlue) VULNERABLE -> AutoBlue / msf exploit/windows/smb/ms17_010_*"
+  any 'Pwn3d'        "$sf"/auth_creds.txt && emit CRIT "supplied creds are ADMIN (Pwn3d) -> evil-winrm / impacket-psexec for a shell"
+  any '\$krb5asrep'  "$sf"/*.txt "$lf"/asrep.txt && emit CRIT "AS-REP roastable hash captured -> hashcat -m 18200"
+  any '\$krb5tgs'    "$sf"/*.txt "$lf"/spn_hashes.txt "$lf"/kerberoast.txt && emit CRIT "Kerberoast SPN hash captured -> hashcat -m 13100"
+  any 'redis_version' "$sf"/*redis*.txt && emit CRIT "redis unauthenticated -> redis-cli, RCE via module load / SSH key write"
+  any '\bWRITE\b'    "$sf"/smb.txt && emit CRIT "WRITABLE SMB share -> drop payload / capture hashes"
+  any 'Anonymous FTP login allowed|Anonymous login successful|230 Login successful' "$sf"/*ftp*.txt && emit CRIT "anonymous FTP allowed -> browse ftp://$TARGET for creds/source"
+  any 'empty.?password|ms-sql-empty-password' "$sf"/*.txt && any 'VULNERABLE|has empty|no password' "$sf"/*.txt && emit CRIT "database with empty/no password -> connect directly"
+  any 'realvnc.auth.bypass|CVE-2006-2369' "$sf"/*vnc*.txt && any 'VULNERABLE' "$sf"/*vnc*.txt && emit CRIT "VNC auth bypass VULNERABLE -> vncviewer $TARGET"
+
+  # ---- HIGH: strong leads / needs one more step ----
+  any '\bREAD\b|Disk .*READ|READ ONLY' "$sf"/smb.txt && emit HIGH "readable SMB share(s) -> smbclient //$TARGET/<share>, hunt configs/creds"
+  any '^dn:|sAMAccountName' "$sf"/*ldap*.txt && emit HIGH "LDAP anonymous bind leaks users/descriptions -> build a userlist, spray/roast"
+  grep -rhE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ \[[^]]+\]' "$sf"/*snmp*.txt 2>/dev/null | head -1 >/dev/null 2>&1 && any '\[[a-z]' "$sf"/*snmp*.txt && emit HIGH "SNMP community string found -> snmpwalk full tree for creds/procs"
+  compgen -G "$wf"/wpscan_*.txt >/dev/null 2>&1 && emit HIGH "WordPress site -> review wpscan output (users, vuln plugins), then wpscan --passwords"
+  any 'critical|high' "$wf"/nuclei_*.txt && emit HIGH "nuclei flagged high/critical web vuln -> see web/nuclei_*.txt"
+  any 'kerberos' "$sf"/*kerberos*.txt && [[ -n "$DOMAIN" ]] && emit HIGH "AD domain $DOMAIN (Kerberos) -> kerbrute userenum, then AS-REP/kerberoast"
+  [[ -s "$lf/users.txt" ]] && emit HIGH "$(grep -c . "$lf/users.txt") AD users harvested (loot/users.txt) -> password-spray (nxc smb -u users.txt -p <pw>), roast"
+
+  # ---- INFO ----
+  [[ ${#DISCOVERED_HOSTS[@]} -gt 0 ]] && emit INFO "hostnames/vhosts: ${DISCOVERED_HOSTS[*]} (ensure in /etc/hosts, fuzz each)"
+
+  if (( n == 0 )); then
+    echo "  ${C_GRN}no high-signal auto-findings${C_RESET} - dig through services/ and web/ by hand"
+    echo "no high-signal auto-findings" >> "$SUMMARY"
+  else
+    # tally so the reader knows at a glance how much is urgent
+    echo
+    printf '  %s%d finding(s):%s %s%d critical%s, %s%d high%s\n' \
+      "${C_BOLD}" "$n" "${C_RESET}" "${C_RED}" "$ncrit" "${C_RESET}" "${C_YEL}" "$nhigh" "${C_RESET}"
+  fi
+}
+
+# ---- web enumeration (fingerprint + dir + vhost + nuclei) ----
+WEB_HOST="${DOMAIN:-${WEB_HOST_AUTO:-$TARGET}}"
+# stable filename slug for a host (so per-host output never collides)
+web_slug(){ printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9.-' '_'; }
+web_tag(){ printf '%s_%s_%s' "$1" "$2" "$(web_slug "$3")"; }   # scheme _ port _ host
+# feroxbuster (preferred) or ffuf dir brute against $1=base-url $2=tag $3=host-header(optional)
+dir_brute(){
+  local base=$1 tag=$2 hdr=${3:-}
+  if have feroxbuster; then
+    # --time-limit is a hard safety cap so a slow/tarpitting host can never hang the
+    # whole run (no auto-tune: it throttles down on errors and two parallel scans on
+    # one box trigger each other's back-off, crawling to a near-stall).
+    feroxbuster -u "$base/" -w "$DIR_WL" -t "$THREADS" -q -k -C 404 --time-limit "$FEROX_TL" \
+      ${hdr:+-H "Host: $hdr"} -o "$OUTDIR/web/ferox_$tag.txt" \
+      -x php,html,txt,bak,zip --no-recursion >/dev/null 2>&1
+  elif have ffuf; then
+    timeout "$FFUF_TL" ffuf -u "$base/FUZZ" -w "$DIR_WL" -t "$THREADS" -mc 200,204,301,302,307,401,403 \
+      ${hdr:+-H "Host: $hdr"} -o "$OUTDIR/web/ffuf_$tag.json" -of json -s >/dev/null 2>&1
+  fi
+}
+# enum_web PORT [HOST]   - HOST defaults to the primary web host; pass a vhost to
+# fingerprint + dir-brute that subdomain too. Connects by hostname (relies on the
+# /etc/hosts entry jasper adds for each discovered vhost).
+enum_web() {
+  local port=$1 host="${2:-$WEB_HOST}" scheme base tag
+  scheme=$(scheme_for "$port"); base="$scheme://$host:$port"; tag=$(web_tag "$scheme" "$port" "$host")
+  # fingerprint (+legacy TLS fallback for old CentOS boxes)
+  have whatweb && whatweb -a3 --colour=never "$base" > "$OUTDIR/web/whatweb_$tag.txt" 2>&1
+  {
+    echo "### $base"
+    curl -sS -k -m 15 -D - -o /dev/null "$base/" 2>&1 \
+      || curl -sS -k -m 15 --tlsv1.0 --ciphers 'DEFAULT@SECLEVEL=0' -D - -o /dev/null "$base/" 2>&1
+    echo "--- title ---";  curl -sS -k -m 15 "$base/" 2>/dev/null | grep -oiP '<title>\K[^<]+' | head -1
+    echo "--- robots ---"; curl -sS -k -m 10 "$base/robots.txt" 2>/dev/null | head -40
+  } > "$OUTDIR/web/headers_$tag.txt" 2>&1
+  [[ "$scheme" == https ]] && have sslscan && sslscan --no-colour "$host:$port" 2>/dev/null | grep -iE 'TLSv1.0|SSLv|self-signed|Subject:|Altname' > "$OUTDIR/web/sslscan_$tag.txt"
+  dir_brute "$base" "$tag"
+  # wordpress? run wpscan
+  if have wpscan && grep -qi 'wordpress' "$OUTDIR/web/whatweb_$tag.txt" 2>/dev/null; then
+    timeout 180 wpscan --url "$base" --no-banner --random-user-agent --disable-tls-checks \
+      -e vp,u > "$OUTDIR/web/wpscan_$tag.txt" 2>&1
+  fi
+  [[ $DO_NUCLEI -eq 1 ]] && have nuclei && \
+    nuclei -u "$base" -silent -severity low,medium,high,critical -o "$OUTDIR/web/nuclei_$tag.txt" >/dev/null 2>&1
+}
+# report dir/wpscan/nuclei results for one host across all web ports.
+# prints each discovered path (e.g. nimbus.htb/login) with a colour-coded status.
+report_web_dirs() {
+  local host="$1" port scheme tag fx ff wp nf n line st url disp c shown
+  local -a paths
+  for port in $WEB_PORTS; do
+    scheme=$(scheme_for "$port"); tag=$(web_tag "$scheme" "$port" "$host")
+    fx="$OUTDIR/web/ferox_$tag.txt"; ff="$OUTDIR/web/ffuf_$tag.json"
+    paths=()
+    if [[ -f "$fx" ]] && grep -qE '^[0-9]{3}[[:space:]]' "$fx"; then
+      mapfile -t paths < <(grep -E '^[0-9]{3}[[:space:]]' "$fx" | awk '{print $1" "$NF}' | sort -u -k2)
+    elif [[ -f "$ff" ]]; then
+      mapfile -t paths < <(jq -r '.results[]? | "\(.status) \(.url)"' "$ff" 2>/dev/null | sort -u -k2)
+    fi
+    if (( ${#paths[@]} > 0 )); then
+      n=${#paths[@]}; ok "[$host:$port] ${C_BOLD}$n${C_RESET} paths ${C_DIM}(★ = worth a look)${C_RESET}"
+      echo "[$host:$port] paths ($n):" >> "$SUMMARY"
+      shown=0
+      for line in "${paths[@]}"; do
+        st="${line%% *}"; url="${line#* }"
+        disp="${url#*://}"; disp="${disp/:$port\//\/}"   # drop scheme + this port
+        echo "  $st $disp" >> "$SUMMARY"
+        if (( shown < 15 )); then
+          case "$st" in 2*) c="$C_GRN";; 3*) c="$C_CYN";; 401|403) c="$C_YEL";; *) c="$C_DIM";; esac
+          # star the juicy ones so the eye jumps straight to them
+          if [[ "$disp" =~ (login|admin|upload|api|dashboard|config|backup|\.git|dev|test|panel|portal|phpmyadmin|robots|\.bak|\.zip|secret|internal) ]]; then
+            printf '      %s%s%s  %s%s%s %s★%s\n' "$c" "$st" "${C_RESET}" "${C_BOLD}" "$disp" "${C_RESET}" "${C_YEL}" "${C_RESET}"
+          else
+            printf '      %s%s%s  %s\n' "$c" "$st" "${C_RESET}" "$disp"
+          fi
+          shown=$((shown+1))
+        fi
+      done
+      (( n > 15 )) && printf '      %s+ %d more -> %s%s\n' "${C_DIM}" "$((n-15))" "$OUTDIR/SUMMARY.txt" "${C_RESET}"
+    fi
+    wp="$OUTDIR/web/wpscan_$tag.txt"; [[ -f "$wp" ]] && { warn "[$host:$port] WordPress -> web/wpscan_$tag.txt"; grep -iE 'User\(s\) Identified|\[\+\] [a-z]' "$wp" | head -10; }
+    nf="$OUTDIR/web/nuclei_$tag.txt"; [[ -s "$nf" ]] && { warn "[$host:$port] nuclei:"; sed 's/^/    /' "$nf" | head; echo "[$host:$port] nuclei:" >> "$SUMMARY"; cat "$nf" >> "$SUMMARY"; }
+  done
+}
+
+# ---------------------------------------------------------------------------
+# PHASE 5 - dispatch enumeration per open port (parallel)
+# ---------------------------------------------------------------------------
+WEB_PORTS=""; SMB_DONE=0; VHOST_FQDNS=()
+if [[ $DO_SVC -eq 1 || $DO_WEB -eq 1 ]]; then
+  phase "SERVICE ENUMERATION"
+  # AD boxes: harvest a real userlist FIRST (synchronous) so the Kerberos module can
+  # AS-REP/kerberoast it. Triggered by any AD-ish port (SMB/LDAP/Kerberos/RPC).
+  if [[ $DO_SVC -eq 1 ]] && { port_open 445 || port_open 139 || port_open 389 || port_open 88 || port_open 135; }; then
+    log "AD user discovery -> loot/users.txt"
+    nusers=$(discover_ad_users)
+    if [[ "${nusers:-0}" -gt 0 ]]; then ok "harvested ${C_BOLD}$nusers${C_RESET} domain users -> loot/users.txt"
+    else log "no users harvested unauthenticated (locked-down or non-AD)"; fi
+  fi
+  for port in $(echo "$OPEN_PORTS" | tr ',' ' '); do
+    svc="${SVC[$port]:-}"
+    # decide handler from service name first, port number as fallback.
+    # web: http/https in the service name, or a known web port (single list)
+    if [[ $DO_WEB -eq 1 ]] && { [[ "$svc" == *http* ]] || [[ " $COMMON_WEB_PORTS " == *" $port "* ]]; }; then
+      WEB_PORTS="$WEB_PORTS $port"; log "web    :$port"; run_bg enum_web "$port"
+    fi
+    [[ $DO_SVC -eq 0 ]] && continue
+    case "$svc,$port" in
+      ftp*|*,21)                 log "ftp    :$port"; run_bg enum_ftp "$port" ;;
+      ssh*|*,22)                 log "ssh    :$port"; run_bg enum_ssh "$port" ;;
+      telnet*|*,23)              log "telnet :$port"; run_bg enum_telnet "$port" ;;
+      vnc*|*,5900|*,5901)        log "vnc    :$port"; run_bg enum_vnc "$port" ;;
+      smtp*|*,25|*,465|*,587)    log "smtp   :$port"; run_bg enum_smtp "$port" ;;
+      domain*|*,53)              log "dns    :$port"; run_bg enum_dns "$port" ;;
+      finger*|*,79)              log "finger :$port"; run_bg enum_finger "$port" ;;
+      msrpc*|*,135)              log "msrpc  :$port"; run_bg enum_rpc "$port" ;;
+      netbios*|microsoft-ds*|*,139|*,445)
+                                 if [[ $SMB_DONE -eq 0 ]]; then SMB_DONE=1; log "smb    :$port"; run_bg enum_smb "$port"; fi ;;
+      ldap*|*,389|*,636|*,3268|*,3269)  log "ldap   :$port"; run_bg enum_ldap "$port" ;;
+      kerberos*|*,88)            log "krb5   :$port"; run_bg enum_kerberos "$port" ;;
+      *,111|*,2049)              log "nfs    :$port"; run_bg enum_nfs "$port" ;;
+      ms-sql*|*,1433)            log "mssql  :$port"; run_bg enum_mssql "$port" ;;
+      mysql*|*,3306)             log "mysql  :$port"; run_bg enum_mysql "$port" ;;
+      postgres*|*,5432)          log "pgsql  :$port"; run_bg enum_pgsql "$port" ;;
+      ms-wbt*|*,3389)            log "rdp    :$port"; run_bg enum_rdp "$port" ;;
+      *,5985|*,5986)             log "winrm  :$port"; run_bg enum_winrm "$port" ;;
+      redis*|*,6379)             log "redis  :$port"; run_bg enum_redis "$port" ;;
+      mongod*|*,27017)           log "mongo  :$port"; run_bg enum_mongo "$port" ;;
+    esac
+  done
+  # --- vhost discovery FIRST, then dir-brute the subdomains IN PARALLEL with the
+  #     still-running main-host dir-brute (previously a serial second pass = 2x wait) ---
+  WEB_PORTS=$(echo $WEB_PORTS | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un | paste -sd' ' -)
+  if [[ $DO_VHOST -eq 1 && -n "$DOMAIN" && "$DOMAIN" == *.* && -n "$WEB_PORTS" ]]; then
+    vport=$(echo $WEB_PORTS | tr ' ' '\n' | head -1); vscheme=$(scheme_for "$vport")
+    vbase="$vscheme://$TARGET:$vport"; vwl=$(pick_wl "$WL_VHOST" "$WL_VHOST_SMALL" /usr/share/amass/wordlists/namelist.txt)
+    have amass && run_bg bash -c "timeout 120 amass enum -passive -d '$DOMAIN' -o '$OUTDIR/vhost/amass.txt' >/dev/null 2>&1"
+    if [[ -n "$vwl" ]] && have ffuf; then
+      log "vhost  : fuzzing Host FUZZ.$DOMAIN on $vbase"
+      # -ac auto-calibrates against several junk hosts so a wildcard/catch-all vhost
+      # (which answers 200 for everything, with size varying by hostname length) gets
+      # filtered dynamically - a single -fs size baseline can't catch that and floods
+      # the results with every wordlist entry.
+      bash -c "fs=\$(curl -sS -k -m 10 -H 'Host: zzjasper$RANDOM.$DOMAIN' '$vbase/' 2>/dev/null | wc -c); ffuf -u '$vbase/' -H 'Host: FUZZ.$DOMAIN' -w '$vwl' -t $THREADS -ac -fs \$fs -o '$OUTDIR/vhost/vhost.json' -of json -s >/dev/null 2>&1" &
+      VFUZZ_PID=$!
+      wait "$VFUZZ_PID" 2>/dev/null   # only the fuzz; main-host enum keeps running in background
+      # parse discovered vhosts (raw FUZZ word, strip any stray domain suffix)
+      if [[ -f "$OUTDIR/vhost/vhost.json" ]]; then
+        mapfile -t VH < <(jq -r '.results[]?.input.FUZZ // .results[]?.host' "$OUTDIR/vhost/vhost.json" 2>/dev/null \
+                          | sed -E "s/\.?${DOMAIN//./\\.}\$//" | grep -E '^[a-zA-Z0-9][a-zA-Z0-9._-]*$' | sort -u)
+        if (( ${#VH[@]} > 25 )); then
+          warn "vhost fuzz returned ${#VH[@]} hits - almost certainly a wildcard/catch-all (filter unreliable). NOT auto-adding; review vhost/vhost.json by hand"
+          sumh "VHOSTS"; echo "wildcard suspected (${#VH[@]} hits) - not auto-added; see vhost/vhost.json" >> "$SUMMARY"
+        elif (( ${#VH[@]} > 0 )); then
+          ok "vhosts discovered:"; sumh "VHOSTS"
+          for h in "${VH[@]}"; do
+            [[ -z "$h" ]] && continue
+            fq="$h.$DOMAIN"; VHOST_FQDNS+=("$fq")
+            printf '      %s%s%s\n' "${C_BOLD}" "$fq" "${C_RESET}"
+            echo "$fq" >> "$SUMMARY"; add_host_entry "$fq"
+          done
+          # launch each subdomain's dir-brute now - overlaps the main-host feroxbuster
+          # still running, so the two web passes finish together instead of back-to-back
+          if [[ $DO_WEB -eq 1 ]]; then
+            for fq in "${VHOST_FQDNS[@]}"; do
+              for wp in $WEB_PORTS; do log "web    :$wp ${G_ARROW} $fq"; run_bg enum_web "$wp" "$fq"; done
+            done
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  # --- join the backgrounded UDP scan + dispatch UDP-service enumeration ---
+  if [[ -n "$UDP_PID" ]]; then
+    wait "$UDP_PID" 2>/dev/null
+    if grep -qE '^[0-9]+/udp +open' "$OUTDIR/scans/udp.txt" 2>/dev/null; then
+      ok "open UDP:"; grep -E '^[0-9]+/udp +open ' "$OUTDIR/scans/udp.txt" | sed 's/^/    /'
+      sumh "OPEN UDP"; grep -E '^[0-9]+/udp +open ' "$OUTDIR/scans/udp.txt" >> "$SUMMARY"
+      while read -r ln; do UDP_SVC[${ln%%/*}]=$(awk '{print $3}' <<<"$ln"); done \
+        < <(grep -E '^[0-9]+/udp +open ' "$OUTDIR/scans/udp.txt")
+    fi
+  fi
+  for uport in "${!UDP_SVC[@]}"; do
+    case "${UDP_SVC[$uport]},$uport" in
+      snmp*|*,161) log "snmp   :$uport/udp"; run_bg enum_snmp "$uport" ;;
+      domain*|*,53) run_bg enum_dns "$uport" ;;
+    esac
+  done
+
+  log "waiting for enumeration jobs..."
+  wait
+  ok "enumeration done"
+fi
+
+# ---------------------------------------------------------------------------
+# PHASE 5b - authenticated re-enum + credential spray (only with -u)
+# ---------------------------------------------------------------------------
+if [[ -n "$CRED_USER" ]]; then
+  if [[ -z "$CRED_PASS" && -z "$CRED_HASH" ]]; then
+    warn "-u given without -p/-H - skipping authenticated pass (need a password or hash)"
+  else
+    CRED_DOMAIN=""; [[ $LOCAL_AUTH -eq 0 ]] && CRED_DOMAIN="$DOMAIN"
+    phase "AUTHENTICATED ENUM (creds: ${CRED_DOMAIN:+$CRED_DOMAIN/}$CRED_USER)"
+    log "spraying creds across open protocols + roasting"
+    auth_enum
+    ok "authenticated pass done -> services/auth_creds.txt"
+    grep -iE 'Pwn3d|\[\+\]|\$krb5' "$SVCDIR/auth_creds.txt" 2>/dev/null | grep -viE 'https://' | sed 's/^/      /' | head -20
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# PHASE 6 - aggregate findings
+# ---------------------------------------------------------------------------
+phase "KEY FINDINGS"
+
+# discover more hosts from web redirects, add them
+if [[ -n "$(ls "$OUTDIR"/web/headers_* 2>/dev/null)" ]]; then
+  mapfile -t NEW_HOSTS < <(harvest_hostnames "$OUTDIR"/web/headers_*.txt)
+  for h in "${NEW_HOSTS[@]}"; do
+    printf '%s\n' "${DISCOVERED_HOSTS[@]}" | grep -qxF "$h" && continue
+    DISCOVERED_HOSTS+=("$h"); add_host_entry "$h"
+  done
+fi
+
+# web dir results (primary host)
+sumh "WEB FINDINGS"
+report_web_dirs "$WEB_HOST"
+
+# service highlights: pull the high-signal lines out of each services/ file
+sumh "SERVICE HIGHLIGHTS"
+if compgen -G "$SVCDIR/*.txt" >/dev/null; then
+  for f in "$SVCDIR"/*.txt; do
+    hits=$(grep -iE 'anonymous|allowed|READ|WRITE|share|namingContext|dnsHostName|\$krb5|does not require|community|export|empty.?password|ms17-010|VULNERABLE|guest|Disk|IPC|bypass|CVE-|publickey|password auth|Pwn3d' "$f" 2>/dev/null \
+           | grep -viE 'NT_STATUS_ACCESS_DENIED|failed|no entries|^note:|next steps|^  (AS-REP roast|Kerberoast|user enum) ' \
+           | sed -E 's/^[[:space:]]*\|_?[[:space:]]*//; s/[[:space:]]+$//' | grep -vE '^$' | sort -u | head -15)
+    if [[ -n "$hits" ]]; then
+      base=$(basename "$f" .txt); ok "${C_BOLD}$base${C_RESET}"
+      echo "$hits" | sed "s/^/      ${C_DIM}/; s/\$/${C_RESET}/"
+      echo "### $base" >> "$SUMMARY"; echo "$hits" | sed 's/^/  /' >> "$SUMMARY"
+    fi
+  done
+else
+  log "no service modules produced output"
+fi
+
+# vhost web dir results - subdomains were fuzzed + dir-brute'd in parallel during
+# service enumeration (PHASE 5), so here we only report what they turned up.
+if (( ${#VHOST_FQDNS[@]} > 0 )); then
+  sumh "VHOST WEB FINDINGS"
+  for fq in "${VHOST_FQDNS[@]}"; do report_web_dirs "$fq"; done
+fi
+
+# ranked, do-this-first attack surface (scans everything gathered above)
+prioritize
+
+# ---------------------------------------------------------------------------
+phase "DONE"
+ok "output ${C_BOLD}$OUTDIR/${C_RESET} ${G_ARROW} read ${C_BOLD}$OUTDIR/SUMMARY.txt${C_RESET}"
+# output tree, dimmed connectors
+tree_line(){ printf '  %s%s%s %s%-10s%s %s\n' "${C_DIM}" "$1" "${C_RESET}" "${C_CYN}" "$2" "${C_RESET}" "${C_DIM}$3${C_RESET}"; }
+tree_line "├─" "scans/"    "rustscan + nmap (tcp, udp, services)"
+tree_line "├─" "services/" "per-service enum (smb, ldap, ftp, snmp, ...)"
+tree_line "├─" "web/"      "fingerprints, dir brute, wpscan, nuclei"
+tree_line "├─" "vhost/"    "vhost + passive subdomains"
+tree_line "╰─" "loot/"     "/etc/hosts backup + scratch"
+if [[ ${#DISCOVERED_HOSTS[@]} -gt 0 ]]; then
+  [[ $IS_ROOT -eq 1 ]] && ok "hosts mapped: ${C_BOLD}${DISCOVERED_HOSTS[*]}${C_RESET}" \
+                       || warn "run ${C_BOLD}sudo jasper $TARGET${C_RESET} to auto-map: ${DISCOVERED_HOSTS[*]}"
+fi
+echo
+printf '%s %sjasper v%s complete%s %sin %s%s\n' \
+  "${C_GRN}${C_BOLD}$G_OK${C_RESET}" "${C_BOLD}" "$VERSION" "${C_RESET}" "${C_DIM}" "$(_el)" "${C_RESET}"
